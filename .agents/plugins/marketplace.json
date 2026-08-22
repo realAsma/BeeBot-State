@@ -1,0 +1,12 @@
+{
+  "name": "beebot",
+  "interface": {"displayName": "BeeBot"},
+  "plugins": [
+    {
+      "name": "beebot-state",
+      "source": {"source": "local", "path": "./plugins/state"},
+      "policy": {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
+      "category": "Productivity"
+    }
+  ]
+}

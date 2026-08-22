@@ -1,0 +1,126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://beebot.local/state-store/schema.json",
+  "title": "BeeBot state store",
+  "description": "Validates both records in this store and documents them. Per-field hints live on `description`, so the rule and the explanation sit together. Loaded at startup; a broken or missing schema refuses every write.",
+
+  "$defs": {
+    "task_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "description": "Globally unique key for a task. THE key: one string, no composite. Also the filename stem, so it may not start with '.', '_' or '-' and may not contain a path separator -- that is what keeps task_state_path structurally inside states/."
+    },
+
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+      "description": "ISO-8601 UTC, second resolution, always 'Z'. Fixed width on purpose: lexicographic order is then chronological, so callers can sort and compare rows as plain strings."
+    },
+
+    "index_row": {
+      "type": "object",
+      "description": "One row of states/index.jsonl. Written by code, never directly. This is the recall path: every field here narrows a search, and nothing here needs a task file opened to be useful.",
+      "additionalProperties": false,
+      "required": ["task_name", "task_state_path", "short_description", "updated", "completion"],
+      "properties": {
+        "task_name": {
+          "$ref": "#/$defs/task_name",
+          "description": "Globally unique. Uniqueness is a cross-record invariant that this schema cannot express; `validate` enforces it."
+        },
+        "task_state_path": {
+          "type": "string",
+          "pattern": "^[^/][^\\u0000]*/[^/\\u0000]+\\.json$",
+          "maxLength": 400,
+          "description": "'<bucket>/<task_name>.json', relative to states/. Stored rather than derived, even though slug(cwd) would reproduce it: that keeps the slug function swappable, so changing how buckets are named leaves old rows resolvable. Never leaves states/ -- no absolute paths, no '..'."
+        },
+        "cwd": {
+          "type": ["string", "null"],
+          "minLength": 1,
+          "maxLength": 4096,
+          "description": "The real working directory this task runs in, outside this store. Optional, and NOT writable after initialize -- the bucket is derived from it, so a mutable cwd would mean moving files. This is the grouping worth querying: 'what else runs in here'."
+        },
+        "short_description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "description": "One line. This is what makes an index worth having -- the other fields narrow by time and place, but choosing the right task needs content, and without it every search would have to open every task file."
+        },
+        "updated": {
+          "$ref": "#/$defs/timestamp",
+          "description": "When anything last happened here. Strictly monotonic per task, so it doubles as the token a stale write is refused against. Always the server's value, never a parameter."
+        },
+        "completion": {
+          "enum": ["open", "done"],
+          "description": "The one-bit fact recall filters on. Not `current_status`, which is prose."
+        }
+      }
+    },
+
+    "task_file": {
+      "type": "object",
+      "description": "One <task_name>.json. Written by AGENTS. Content only -- the index row carries identity, location and time.",
+      "additionalProperties": false,
+      "required": [],
+      "properties": {
+        "description": {
+          "type": "string",
+          "maxLength": 4000,
+          "description": "What this is, and what done looks like. `completion` has to be judged against something."
+        },
+        "current_status": {
+          "type": "string",
+          "maxLength": 4000,
+          "description": "Where things stand right now."
+        },
+        "prior_actions": {
+          "type": "array",
+          "maxItems": 40,
+          "items": {"type": "string", "minLength": 1, "maxLength": 1000},
+          "description": "Short and high-level: what was attempted, and how it turned out. Dead ends matter most; they are what an arriving agent would otherwise rediscover. Rewritten whole on every write, never appended, so staying short is a choice made each time rather than deferred cleanup."
+        },
+        "next_steps": {
+          "type": "array",
+          "maxItems": 40,
+          "items": {"type": "string", "minLength": 1, "maxLength": 1000},
+          "description": "What to do next. Rewritten whole."
+        },
+        "blockers": {
+          "type": "array",
+          "maxItems": 40,
+          "items": {"type": "string", "minLength": 1, "maxLength": 1000},
+          "description": "What is stopping progress. Empty is the normal case. Rewritten whole."
+        },
+        "artifacts": {
+          "type": "array",
+          "maxItems": 100,
+          "description": "Pointers only. The bytes live in the cwd, not here.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path"],
+            "properties": {
+              "path": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096,
+                "description": "Where the artifact actually is, in the task's cwd or elsewhere on disk."
+              },
+              "note": {
+                "type": "string",
+                "maxLength": 300,
+                "description": "What it is and why it matters."
+              }
+            }
+          }
+        },
+        "final_learnings": {
+          "type": "string",
+          "maxLength": 8000,
+          "description": "OPTIONAL, usually written once at the end. Different audience from `prior_actions`: that serves whoever picks THIS task up, this serves whoever hits the same problem on another task, and is what makes closed tasks worth keeping."
+        }
+      }
+    }
+  }
+}
