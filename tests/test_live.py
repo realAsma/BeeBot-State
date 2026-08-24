@@ -3,8 +3,8 @@
 test_store.py covers the store in-process. This covers the gap between "the
 function works" and "the tool works" -- where a schema mismatch, an
 unserializable return, or a missing annotation hides -- plus everything that is
-a property of the SERVER rather than the store: freshness, the two
-registrations, annotations, and initialization.
+a property of the SERVER rather than the store: freshness, annotations, and
+initialization.
 """
 
 from __future__ import annotations
@@ -179,12 +179,13 @@ def test_the_resolved_directory_is_announced_on_stderr(states: Path):
 
 def test_a_task_can_be_created_filled_and_found(sessions):
     session = sessions()
-    session.call("state_initialize", task_name="build-store", cwd="/work/here",
-                 short_description="Build the memory store")
+    initialized = session.call("state_initialize", task_name="build-store", cwd="/work/here",
+                               short_description="Build the memory store")
     session.call("state_update", task_name="build-store",
+                 write_token=initialized["write_token"],
                  current_status="Core and server done.",
                  prior_actions=["Tried deriving the bucket at read time; it has to stay stored."],
-                 artifacts=[{"path": "server.py", "note": "the four tools"}])
+                 artifacts=[{"item": "server.py", "note": "the four tools"}])
 
     assert [r["task_name"] for r in
             session.call("state_index_search", cwd="/work/here", completion="open", limit=0)] \
@@ -198,9 +199,11 @@ def test_a_task_can_be_created_filled_and_found(sessions):
 
 def test_an_omitted_field_is_left_alone(sessions):
     session = sessions()
-    session.call("state_initialize", task_name="t", short_description="d")
-    session.call("state_update", task_name="t", current_status="first", blockers=["waiting"])
-    session.call("state_update", task_name="t", current_status="second")
+    initialized = session.call("state_initialize", task_name="t", short_description="d")
+    first = session.call("state_update", task_name="t", write_token=initialized["write_token"],
+                         current_status="first", blockers=["waiting"])
+    session.call("state_update", task_name="t", write_token=first["write_token"],
+                 current_status="second")
     record = session.call("state_get", task_name="t")
     assert record["current_status"] == "second" and record["blockers"] == ["waiting"]
 
@@ -213,19 +216,6 @@ def test_registrations_expose_what_they_should(sessions):
     assert "state_semantic_search" not in tools
 
 
-def test_scoped_registration_needs_no_task_name(sessions):
-    setup = sessions()
-    setup.call("state_initialize", task_name="mine", short_description="d")
-    scoped = sessions("--task", "mine")
-    assert scoped.call("state_get")["task_name"] == "mine"
-    scoped.call("state_update", current_status="no task_name needed")
-
-
-def test_unscoped_get_with_no_task_says_what_to_do_instead(sessions):
-    with pytest.raises(ToolFailed, match="state_index_search"):
-        sessions().call("state_get")
-
-
 def test_schemas_come_from_the_signatures(sessions):
     # Nothing here is hand-written: the types come from the annotations and the
     # prose from the docstring, so a parameter cannot be documented as one thing
@@ -234,15 +224,17 @@ def test_schemas_come_from_the_signatures(sessions):
     update = tools["state_update"]["inputSchema"]["properties"]
     assert {"type": "array", "items": {"type": "string"}} in update["prior_actions"]["anyOf"]
     assert {"type": "string", "enum": ["open", "done"]} in update["completion"]["anyOf"]
+    assert update["write_token"]["type"] == "string"
+    assert "write_token" in tools["state_update"]["inputSchema"]["required"]
     search = tools["state_index_search"]["inputSchema"]["properties"]
     assert search["limit"]["default"] == 20 and search["limit"]["minimum"] == 0
-    assert "DEAD ENDS MATTER MOST" in tools["state_update"]["description"]
 
 
 def test_tools_declare_annotations(sessions):
     tools = sessions().tools()
     assert tools["state_get"]["annotations"]["readOnlyHint"] is True
-    assert tools["state_update"]["annotations"]["destructiveHint"] is False
+    assert tools["state_update"]["annotations"]["destructiveHint"] is True
+    assert tools["state_initialize"]["annotations"]["destructiveHint"] is False
 
 
 def test_a_violation_reaches_the_client_as_a_readable_error(sessions):
@@ -252,39 +244,55 @@ def test_a_violation_reaches_the_client_as_a_readable_error(sessions):
 
 def test_an_unknown_field_is_rejected_not_dropped(sessions):
     session = sessions()
-    session.call("state_initialize", task_name="t", short_description="d")
+    initialized = session.call("state_initialize", task_name="t", short_description="d")
     with pytest.raises(ToolFailed):
-        session.call("state_update", task_name="t", currrent_status="typo")
+        session.call("state_update", task_name="t", write_token=initialized["write_token"],
+                     currrent_status="typo")
 
 
 # ---------------------------------------------------------------- freshness
 
 
-def test_a_blind_write_is_refused(sessions):
+def test_a_missing_write_token_is_refused(sessions):
     sessions().call("state_initialize", task_name="t", short_description="d")
-    with pytest.raises(ToolFailed, match="no prior read"):
+    with pytest.raises(ToolFailed, match="write_token"):
         sessions().call("state_update", task_name="t", current_status="blind")
 
 
-def test_a_lost_update_is_refused_across_two_processes(sessions):
-    sessions().call("state_initialize", task_name="t", short_description="d")
-
-    mine, theirs = sessions(), sessions()
-    mine.call("state_get", task_name="t")
-    theirs.call("state_get", task_name="t")
-    theirs.call("state_update", task_name="t", current_status="theirs")
-
-    with pytest.raises(ToolFailed, match="changed since you read it"):
-        mine.call("state_update", task_name="t", current_status="mine")
-    # The refusal is the useful part: re-read and the retry goes through.
-    mine.call("state_get", task_name="t")
-    assert mine.call("state_update", task_name="t", current_status="mine")["updated"]
-
-
-def test_initialize_counts_as_a_read(sessions):
+def test_a_mismatched_write_token_is_refused(sessions):
     session = sessions()
     session.call("state_initialize", task_name="t", short_description="d")
-    session.call("state_update", task_name="t", current_status="no state_get needed")
+    with pytest.raises(ToolFailed, match="changed since you read it"):
+        session.call("state_update", task_name="t", write_token="not-the-token",
+                     current_status="blind")
+
+
+def test_a_lost_update_is_refused_for_two_callers_on_one_session(sessions):
+    session = sessions()
+    session.call("state_initialize", task_name="t", short_description="d")
+
+    mine = session.call("state_get", task_name="t")["write_token"]
+    theirs = session.call("state_get", task_name="t")["write_token"]
+    session.call("state_update", task_name="t", write_token=theirs,
+                 current_status="theirs")
+
+    with pytest.raises(ToolFailed, match="changed since you read it"):
+        session.call("state_update", task_name="t", write_token=mine,
+                     current_status="mine")
+    # The refusal is the useful part: re-read and the retry goes through.
+    fresh = session.call("state_get", task_name="t")["write_token"]
+    assert session.call("state_update", task_name="t", write_token=fresh,
+                        current_status="mine")["updated"]
+
+
+def test_initialize_returns_the_first_token_and_update_returns_the_next(sessions):
+    session = sessions()
+    initialized = session.call("state_initialize", task_name="t", short_description="d")
+    updated = session.call("state_update", task_name="t",
+                           write_token=initialized["write_token"],
+                           current_status="no state_get needed")
+    assert updated["updated"] == updated["write_token"]
+    assert updated["write_token"] != initialized["write_token"]
 
 
 # ----------------------------------------------------------------- validate

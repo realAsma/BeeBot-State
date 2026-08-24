@@ -8,16 +8,6 @@ Tools:
 
 None of the tools spawn a model.
 
-ONE server, TWO registrations, and every tool behaves sanely in each:
-
-  Scoped     --task <name>   a host dispatching agents per task. Saves a
-                             discovery round trip. A convenience, not a
-                             guarantee -- nothing downstream may assume a task
-                             is correct because it was the default.
-  Unscoped   (no args)       a user's own interactive session. No default task;
-                             state_get() with no argument is an error naming
-                             what to do instead.
-
 Also `--validate`, which re-checks the whole store and exits. Not a tool: it
 adjudicates hand-edits, which is not a thing an agent mid-task should be asked
 to do.
@@ -57,71 +47,49 @@ ASSETS = HERE / "assets"
 # assume the worst.
 READ = ToolAnnotations(readOnlyHint=True, destructiveHint=False,
                        idempotentHint=True, openWorldHint=False)
-# Not destructive, and that is a design property: there is no delete, every
-# write is validated before it lands, and a write that would overwrite somebody
-# else's is refused rather than merged.
-WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False,
-                        idempotentHint=False, openWorldHint=False)
+# Initialize creates a new record; update replaces supplied strings and lists.
+CREATE = ToolAnnotations(readOnlyHint=False, destructiveHint=False,
+                         idempotentHint=False, openWorldHint=False)
+UPDATE = ToolAnnotations(readOnlyHint=False, destructiveHint=True,
+                         idempotentHint=False, openWorldHint=False)
 mcp = FastMCP("state", instructions="""Long-term state for long-running tasks.
 
 A task is one index row (identity, time, place, one-line summary) plus one file
 of prose (status, prior actions, next steps, blockers, artifacts). The row is
 what you search; the file is what you read once you have chosen.
 
-TO FIND YOUR OWN TASK, do not guess and do not delegate:
+TO FIND YOUR OWN TASK, use the mechanical search first:
     state_index_search(cwd="<the directory you are working in>", completion="open")
-Pick by short_description, then state_get it.
+Pick by short_description, then state_get it. Use state-ask only if candidates
+remain ambiguous.
 
-TO WRITE: state_get first, always. The server remembers what it served you and
-refuses a write against a version you have not seen, which is what stops two
-agents silently erasing each other.
+TO WRITE: state_get returns the write_token that state_update requires. A stale
+token is refused, which stops two callers silently erasing each other.
 
 This store is written through these tools and never by hand. A hand-edit
 bypasses the schema, and a record that never met the schema can pass and lie.
 """)
 
 # Set by main(); the tools are a thin shell over it.
-STATE: "StateServer" = None  # type: ignore[assignment]
-
-
-class StateServer:
-    def __init__(self, states_dir: Path, *, default_task: str | None = None):
-        self.store = Store(states_dir)
-        self.default_task = default_task
-        # Freshness: the server is launched per agent, so it remembers the
-        # `updated` it last served and compares. The agent never supplies a
-        # token. Not ownership -- "has this changed since I read it" is
-        # answerable from the record; "should I be working this" is not
-        # memory's business.
-        self.served: dict[str, str] = {}
-
-    def task(self, task_name: str | None) -> str:
-        if name := (task_name or self.default_task):
-            return name
-        raise ValueError(
-            "no task_name given and this server has no default task. Find yours with "
-            "state_index_search(cwd=<your working directory>, completion='open').")
+STORE: Store = None  # type: ignore[assignment]
 
 
 @mcp.tool(annotations=READ)
-def state_get(task_name: str | None = None) -> dict:
+def state_get(task_name: str) -> dict:
     """The whole record for one task: task file fields plus the index row, merged.
 
     Reads are unrestricted, and nothing about ownership comes back -- whether
     you SHOULD be working a task is an execution question answered elsewhere.
 
-    Reading is also what makes a later state_update possible: the server
-    remembers what it served you and refuses a write against a version you have
-    not seen.
+    The returned `write_token` is the `updated` observed under the store's read
+    lock. It is neither a read timestamp nor an mtime, and is not separately
+    persisted. Pass it to a later state_update.
 
     Args:
-        task_name: The task to read. Defaults to this server's task if it was
-            launched with one; otherwise required.
+        task_name: The task to read.
     """
-    name = STATE.task(task_name)
-    record = STATE.store.get(name)
-    STATE.served[name] = record["updated"]
-    return record
+    record = STORE.get(task_name)
+    return {**record, "write_token": record["updated"]}
 
 
 @mcp.tool(annotations=READ)
@@ -158,14 +126,14 @@ def state_index_search(
             picking one task off a list. A SWEEP IS NOT -- pass limit=0. Silent
             truncation manufactures a false "nothing found".
     """
-    return STATE.store.search(Filters(since=since, until=until, completion=completion,
-                                      cwd=cwd, limit=limit))
+    return STORE.search(Filters(since=since, until=until, completion=completion,
+                                cwd=cwd, limit=limit))
 
 
-@mcp.tool(annotations=WRITE)
+@mcp.tool(annotations=CREATE)
 def state_initialize(task_name: str, short_description: str,
                      cwd: str | None = None) -> dict:
-    """File a new task: STRUCTURE ONLY.
+    """File a new task and return its first `write_token`: STRUCTURE ONLY.
 
     It takes exactly the fields the index row cannot be valid without;
     everything else is content, and content has one writer -- call state_update
@@ -185,16 +153,14 @@ def state_initialize(task_name: str, short_description: str,
             here or never: it is not writable afterwards, and it is how the next
             agent in that directory finds this task at all.
     """
-    row = STATE.store.initialize(task_name, short_description, cwd)
-    # An agent that just created a task knows its state; requiring a read of a
-    # file it wrote empty a moment ago would buy nothing.
-    STATE.served[task_name] = row["updated"]
-    return {"task_name": row["task_name"]}
+    row = STORE.initialize(task_name, short_description, cwd)
+    return {"task_name": row["task_name"], "write_token": row["updated"]}
 
 
-@mcp.tool(annotations=WRITE)
+@mcp.tool(annotations=UPDATE)
 def state_update(
-    task_name: str | None = None,
+    task_name: str,
+    write_token: str,
     description: str | None = None,
     current_status: str | None = None,
     prior_actions: list[str] | None = None,
@@ -205,34 +171,32 @@ def state_update(
     completion: Literal["open", "done"] | None = None,
     short_description: str | None = None,
 ) -> dict:
-    """All content, in ONE call. Returns the new `updated`.
+    """All content, in ONE call. Returns the new `updated` and `write_token`.
 
     You never write either file directly and do not need to know which field
     lives where. `updated` is always the server's, never a parameter -- which is
     why the call returns it. Omitted fields are left alone; supplied list fields
     are rewritten WHOLE, never appended to.
 
-    REFUSED ON EXACTLY ONE CONDITION: a stale read. Call state_get first; if
-    somebody wrote since, the refusal says so and you re-read and retry. There
-    is no ownership check -- memory's job is only to stop either agent silently
-    erasing the other.
+    A write is refused for a stale or missing `write_token`, a schema violation,
+    an unknown field, or a task that does not exist. If the token is stale,
+    re-read, merge, and retry.
 
     There is no delete. A task becomes completion="done".
 
     Args:
-        task_name: The task to write. Defaults to this server's task if it was
-            launched with one.
+        task_name: The task to write.
+        write_token: The token returned by state_get or state_initialize.
         description: What this is, and what done looks like. `completion` has to
             be judged against something.
         current_status: Where things stand right now.
         prior_actions: What was attempted and how it turned out, short and
-            high-level. DEAD ENDS MATTER MOST -- they are what an arriving agent
-            would otherwise rediscover. Rewritten whole, so staying short is a
-            choice made each time rather than deferred cleanup.
+            high-level. Dead ends are what an arriving agent would otherwise
+            rediscover. Rewritten whole.
         next_steps: What to do now, concrete enough to start on.
         blockers: What is stopping progress, and who or what is being waited on.
-        artifacts: [{"path": ..., "note": ...}] -- pointers only. The bytes live
-            in the working directory, not here.
+        artifacts: [{"item": ..., "note": ...}]. Item is any durable reference:
+            a path, link, commit, or job ID.
         final_learnings: Usually written once, at the end. A different audience
             from prior_actions: that serves whoever picks THIS task up, this
             serves whoever hits the same problem on another task. It is what
@@ -240,22 +204,14 @@ def state_update(
         completion: "open" or "done".
         short_description: Replace the index one-liner. At most 120 characters.
     """
-    name = STATE.task(task_name)
-    # A session-local fact, so it is answerable here. Whether the read is still
-    # current is a disk fact, and the store settles that inside its lock.
-    held = STATE.served.get(name)
-    if held is None:
-        raise ValueError(f"no prior read of {name!r} in this session. "
-                         f"Call state_get({name!r}) and retry.")
-
     given = {"description": description, "current_status": current_status,
              "prior_actions": prior_actions, "next_steps": next_steps,
              "blockers": blockers, "artifacts": artifacts,
              "final_learnings": final_learnings, "completion": completion,
              "short_description": short_description}
     fields = {key: value for key, value in given.items() if value is not None}
-    STATE.served[name] = updated = STATE.store.update(name, fields, expected=held)
-    return {"updated": updated}
+    updated = STORE.update(task_name, fields, expected=write_token)
+    return {"updated": updated, "write_token": updated}
 
 
 def prepare(states_dir: Path) -> Path:
@@ -311,12 +267,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--states", type=Path, default=None,
                         help="the data directory "
                              "(default: $BEEBOT_STATE_DIR, else ~/.beebot_states)")
-    parser.add_argument("--task", help="scoped registration: the default task_name")
     parser.add_argument("--validate", action="store_true",
                         help="re-check the whole store and exit")
     args = parser.parse_args(argv)
 
-    global STATE
+    global STORE
     try:
         states_dir, source = resolve_states_dir(args.states)
     except RuntimeError as exc:
@@ -325,20 +280,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"state: cannot determine the data directory: {exc}", file=sys.stderr)
         return 2
     try:
-        STATE = StateServer(prepare(states_dir), default_task=args.task)
+        STORE = Store(prepare(states_dir))
     except (StoreError, OSError, RuntimeError) as exc:
         print(f"state: cannot use {states_dir} (from {source}): {exc}", file=sys.stderr)
         return 2
     # stderr, never stdout: stdout is the JSON-RPC channel and a stray line
     # there corrupts the handshake.
-    print(f"state: store at {STATE.store.dir} (from {source})", file=sys.stderr)
+    print(f"state: store at {STORE.dir} (from {source})", file=sys.stderr)
 
     if args.validate:
-        if problems := STATE.store.validate():
+        if problems := STORE.validate():
             print("\n".join(problems), file=sys.stderr)
             print(f"\n{len(problems)} problem(s)", file=sys.stderr)
             return 1
-        print(f"{STATE.store.dir}: {len(STATE.store.read_index())} task(s), no problems")
+        print(f"{STORE.dir}: {len(STORE.read_index())} task(s), no problems")
         return 0
 
     mcp.run()

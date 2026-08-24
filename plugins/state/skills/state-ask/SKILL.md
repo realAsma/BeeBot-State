@@ -16,4 +16,5 @@ Give the subagent only these instructions:
 - Open every potentially relevant task in each window.
 - Stop when answered, except a negative answer requires the complete sweep.
 - Include open and completed tasks; respect any requested `cwd` or `since`.
-- Return exactly `{answer, sources}`, listing every opened task in `sources`.
+- Return exactly `{answer: string, sources: list[string]}`. `sources` lists only
+  task names that support the answer, not every task opened during the sweep.

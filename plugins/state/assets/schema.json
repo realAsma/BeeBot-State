@@ -33,7 +33,7 @@
           "type": "string",
           "pattern": "^[^/][^\\u0000]*/[^/\\u0000]+\\.json$",
           "maxLength": 400,
-          "description": "'<bucket>/<task_name>.json', relative to states/. Stored rather than derived, even though slug(cwd) would reproduce it: that keeps the slug function swappable, so changing how buckets are named leaves old rows resolvable. Never leaves states/ -- no absolute paths, no '..'."
+          "description": "'<bucket>/<task_name>.json', relative to states/. Stored rather than derived, even though slug(cwd) would reproduce it: that keeps the slug function swappable, so changing how buckets are named leaves old rows resolvable. Containment is enforced by resolve_in_store, not by this pattern alone."
         },
         "cwd": {
           "type": ["string", "null"],
@@ -66,50 +66,50 @@
       "properties": {
         "description": {
           "type": "string",
-          "maxLength": 4000,
+          "maxLength": 6000,
           "description": "What this is, and what done looks like. `completion` has to be judged against something."
         },
         "current_status": {
           "type": "string",
-          "maxLength": 4000,
+          "maxLength": 6000,
           "description": "Where things stand right now."
         },
         "prior_actions": {
           "type": "array",
-          "maxItems": 40,
-          "items": {"type": "string", "minLength": 1, "maxLength": 1000},
+          "maxItems": 30,
+          "items": {"type": "string", "minLength": 1, "maxLength": 1500},
           "description": "Short and high-level: what was attempted, and how it turned out. Dead ends matter most; they are what an arriving agent would otherwise rediscover. Rewritten whole on every write, never appended, so staying short is a choice made each time rather than deferred cleanup."
         },
         "next_steps": {
           "type": "array",
-          "maxItems": 40,
-          "items": {"type": "string", "minLength": 1, "maxLength": 1000},
+          "maxItems": 20,
+          "items": {"type": "string", "minLength": 1, "maxLength": 1200},
           "description": "What to do next. Rewritten whole."
         },
         "blockers": {
           "type": "array",
-          "maxItems": 40,
-          "items": {"type": "string", "minLength": 1, "maxLength": 1000},
+          "maxItems": 10,
+          "items": {"type": "string", "minLength": 1, "maxLength": 1200},
           "description": "What is stopping progress. Empty is the normal case. Rewritten whole."
         },
         "artifacts": {
           "type": "array",
-          "maxItems": 100,
-          "description": "Pointers only. The bytes live in the cwd, not here.",
+          "maxItems": 50,
+          "description": "Durable references only; referenced content lives elsewhere.",
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["path"],
+            "required": ["item"],
             "properties": {
-              "path": {
+              "item": {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 4096,
-                "description": "Where the artifact actually is, in the task's cwd or elsewhere on disk."
+                "description": "Any durable reference -- a path, link, commit, or job ID."
               },
               "note": {
                 "type": "string",
-                "maxLength": 300,
+                "maxLength": 600,
                 "description": "What it is and why it matters."
               }
             }
@@ -117,7 +117,7 @@
         },
         "final_learnings": {
           "type": "string",
-          "maxLength": 8000,
+          "maxLength": 12000,
           "description": "OPTIONAL, usually written once at the end. Different audience from `prior_actions`: that serves whoever picks THIS task up, this serves whoever hits the same problem on another task, and is what makes closed tasks worth keeping."
         }
       }

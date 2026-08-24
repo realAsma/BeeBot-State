@@ -35,16 +35,9 @@ listing does not have to open anything.
        <cwd>        updated <updated>
    ```
 
-   Group by `cwd` when the rows span more than two directories; that grouping is
-   the one the store is designed around.
-
-4. **Flag what has gone quiet.** Compare `updated` against now — anything open
-   and untouched for more than a couple of weeks is worth calling out, because
-   nothing else in the store will.
-
-5. **Do not open task files.** If the user then asks about one, `state_get` it.
+4. **Do not open task files.** If the user then asks about one, `state_get` it.
    If they ask a question ABOUT the work rather than for the list —
    "what's blocked on the deploy?" — invoke `beebot-state:state-ask`.
 
-6. If nothing comes back, say the store has no open tasks. Do not widen the
+5. If nothing comes back, say the store has no open tasks. Do not widen the
    filters and re-run without saying so.

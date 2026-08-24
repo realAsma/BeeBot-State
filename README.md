@@ -38,14 +38,27 @@ codex plugin marketplace add /path/to/state_store  # also accepts owner/repo or 
 codex plugin add beebot-state@beebot
 ```
 
+The state server writes to `~/.beebot_states` by default. Add that directory to
+the global Codex workspace-write sandbox in `~/.codex/config.toml`:
+
+```toml
+[sandbox_workspace_write]
+writable_roots = ["/home/you/.beebot_states"]
+```
+
+If `writable_roots` already exists, add the state directory to its existing
+array instead of creating another table or key. Use the absolute path to your
+home directory, then restart Codex so the updated sandbox configuration applies.
+
 ## Interface
 
 The MCP server exposes four mechanical tools:
 
-- `state_get`: read a complete task.
+- `state_get`: read a complete task and its `write_token`.
 - `state_index_search`: filter tasks by time, completion, or working directory.
-- `state_initialize`: create a task.
-- `state_update`: update a task after a freshness-checked read.
+- `state_initialize`: create a task and return its first `write_token`.
+- `state_update`: update a task using the `write_token` returned by
+  `state_get` or `state_initialize`.
 
 Workflow skills provide the user-facing operations:
 

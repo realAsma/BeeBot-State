@@ -13,11 +13,6 @@ three weeks. There is no cheaper mode: a save that only makes sense to whoever
 was already here is a save that has to be redone, and nobody discovers that
 until the context is gone.
 
-There is no session key to route by, and deliberately so. A terminal session id
-names a SESSION, not a thread of work: it differs every time a shell opens, so a
-fresh session would match nothing, and the same ongoing work saved from two
-terminals would produce two keys.
-
 ## Execution
 
 1. **Find the task, mechanically first.**
@@ -34,7 +29,13 @@ terminals would produce two keys.
    this `cwd`. Take the task_name from `sources`. If the mechanical search
    returned no candidates, this is new work — go directly to step 3.
 
-3. **If no task matches, initialize one.** Pick a `task_name` that is unique,
+3. **Get the record and write token.** If a task matches, read it:
+
+   ```
+   state_get(task_name="<the task>")
+   ```
+
+   If no task matches, initialize one. Pick a `task_name` that is unique,
    lower-case, hyphenated, and describes the work rather than the session:
 
    ```
@@ -43,31 +44,23 @@ terminals would produce two keys.
                     short_description="<one line, at most 120 characters>")
    ```
 
-   `cwd` is set here or never. Pass it — it is what lets the next agent in this
-   directory find the task at all.
+   `cwd` is set here or never. Pass it. Both `state_get` and `state_initialize`
+   return the `write_token` for the next step; do not re-read a task you just
+   initialized.
 
-4. **Read before writing.** Always, even if you just initialized:
-
-   ```
-   state_get(task_name="<the task>")
-   ```
-
-   The write is refused without this, and refused again if somebody else has
-   written since. That refusal is the point: it is what stops your save from
-   silently erasing theirs.
-
-5. **Write the content, in one call.** Merge with what step 4 returned — every
+4. **Write the content, in one call.** Merge with what step 3 returned — every
    list field is rewritten WHOLE, so carry forward what still matters and drop
    what does not.
 
    ```
    state_update(task_name="<the task>",
+                write_token="<token from step 3>",
                 description="<what this is, and what done looks like>",
                 current_status="<where things stand, in enough detail to act on>",
                 prior_actions=[...],
                 next_steps=[...],
                 blockers=[...],
-                artifacts=[{"path": "...", "note": "..."}])
+                artifacts=[{"item": "...", "note": "..."}])
    ```
 
    Hold each field to this standard:
@@ -87,22 +80,33 @@ terminals would produce two keys.
      fails at line 40" is.
    - `blockers` — say who or what is being waited on, not just that something is
      blocked.
-   - `artifacts` — every path the next person needs, with a note on what each
-     one is. Pointers only; the bytes stay in the working directory.
+   - `artifacts` — every durable reference the next person needs, with a note on
+     what each one is. An item may be a path, link, commit, or job ID.
    - `short_description` — only if the one-line summary no longer fits the work.
 
-6. **Anything you were carrying only in your head goes in now.** Assumptions,
+5. **Anything you were carrying only in your head goes in now.** Assumptions,
    the reason a rejected approach was rejected, a fact learned from a colleague.
    If it is not in the record it does not exist.
 
-7. **If the work is finished**, add `completion="done"` and write
+6. **If the work is finished**, add `completion="done"` and write
    `final_learnings`: what somebody hitting this same problem on a DIFFERENT
    task would need. That is a different audience from `prior_actions`, and it is
    what makes a closed task worth keeping.
 
-8. **If the write was refused as stale**, re-run step 4, re-merge against the
-   record you just read, and retry step 5. Somebody else wrote while you were
-   composing. Do not force it and do not work around it.
+7. **If the write was refused as stale**, re-run `state_get`, take its new
+   `write_token`, re-merge against the record you just read, and retry step 4.
+   Somebody else wrote while you were composing. Do not force it or work around
+   it.
+
+8. **If the store reports a limit error**, keep the persisted field concise. If
+   omitted detail must survive, write or update the single workspace-relative
+   file `agent_art/states/<task-name>.md`, add or keep
+   `{"item": "agent_art/states/<task-name>.md", "note": "Detailed task notes."}`
+   in the complete artifacts list, and retry step 4 with the concise field and
+   complete list. Use one document per task, not one per save. The server never
+   creates or modifies this file. If the task has no usable workspace, keep the
+   state concise and ask the user where durable detail should go; do not invent
+   a path.
 
 9. Tell the user which task you saved to, the new `updated`, and a one-line
    summary of what the next person will find.

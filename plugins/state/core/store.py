@@ -162,19 +162,16 @@ class Store:
         try:
             self.schema = json.loads((self.dir / "schema.json").read_text("utf-8"))
             jsonschema.Draft202012Validator.check_schema(self.schema)
-        except (OSError, ValueError, jsonschema.SchemaError) as exc:
+            definitions = self.schema["$defs"]
+            for name in ("index_row", "task_file"):
+                definitions[name]
+        except (OSError, ValueError, KeyError, jsonschema.SchemaError) as exc:
             raise StoreError(f"schema unusable, so every write is refused: {exc}") from exc
         self._checkers = {
             name: jsonschema.Draft202012Validator(
-                {"$ref": f"#/$defs/{name}", "$defs": self.schema["$defs"]})
+                {"$ref": f"#/$defs/{name}", "$defs": definitions})
             for name in ("index_row", "task_file")
         }
-
-    def properties(self, record: str) -> dict[str, dict]:
-        """schema.json's per-property blocks. The `description` on each is where
-        per-field hints live, so the rule and its explanation sit together --
-        and the tool schemas are built from these rather than restating them."""
-        return self.schema["$defs"][record]["properties"]
 
     def check(self, record: str, value: Any) -> None:
         errors = sorted(self._checkers[record].iter_errors(value), key=lambda e: list(e.path))
@@ -197,25 +194,22 @@ class Store:
         return rows
 
     def row(self, task_name: str) -> dict[str, Any]:
-        for candidate in self.read_index():
-            if candidate.get("task_name") == task_name:
-                return candidate
-        raise NotFound(f"no task named {task_name!r}")
+        return _row_in(self.read_index(), task_name)
 
     def get(self, task_name: str) -> dict[str, Any]:
         """The whole record: task file fields plus the index row, merged, so
         callers never see the split. Nothing about ownership comes back --
         whether an agent SHOULD be working a task is answered elsewhere.
 
-        Row and file are read without the lock, so a write landing between them
-        can return a row stamped T1 merged with content from T2. Self-
-        correcting: the reader's next write is refused against the newer
-        `updated` and it re-reads."""
-        row = self.row(task_name)
-        path = resolve_in_store(self.dir, row["task_state_path"])
-        if not path.exists():
-            raise NotFound(f"{task_name!r} has an index row but no file; run `serve --validate`")
-        return {**json.loads(path.read_text("utf-8")), **_public(row)}
+        The index row and task file are read under one shared lock, so the
+        merged record is a consistent snapshot."""
+        with self._locked(shared=True):
+            row = _row_in(self.read_index(), task_name)
+            path = resolve_in_store(self.dir, row["task_state_path"])
+            if not path.exists():
+                raise NotFound(
+                    f"{task_name!r} has an index row but no file; run `serve --validate`")
+            return {**json.loads(path.read_text("utf-8")), **_public(row)}
 
     def search(self, filters: Filters) -> list[dict[str, Any]]:
         """Index rows only, newest first. Mechanical: time, state, place.
@@ -297,11 +291,9 @@ class Store:
 
         with self._locked():
             rows = self.read_index()
-            index = next((i for i, r in enumerate(rows)
-                          if r.get("task_name") == task_name), None)
-            if index is None:
-                raise NotFound(f"no task named {task_name!r}")
-            row = dict(rows[index])
+            current = _row_in(rows, task_name)
+            index = rows.index(current)
+            row = dict(current)
             if expected is not None and row.get("updated") != expected:
                 raise StoreError(
                     f"{task_name!r} changed since you read it (you have {expected}, the "
@@ -356,11 +348,10 @@ class Store:
     # ---------------------------------------------------------------- private
 
     @contextmanager
-    def _locked(self):
-        """One writer at a time: read-modify-write of the index is otherwise a
-        lost update, which is what freshness exists to make impossible."""
+    def _locked(self, shared: bool = False):
+        """Coordinate readers and writers around a consistent store snapshot."""
         with open(self.dir / ".lock", "w") as handle:
-            fcntl.flock(handle, fcntl.LOCK_EX)
+            fcntl.flock(handle, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
             try:
                 yield
             finally:
@@ -376,9 +367,15 @@ def _public(row: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in row.items() if k not in INTERNAL}
 
 
+def _row_in(rows: list[dict[str, Any]], task_name: str) -> dict[str, Any]:
+    for row in rows:
+        if row.get("task_name") == task_name:
+            return row
+    raise NotFound(f"no task named {task_name!r}")
+
+
 def _write(path: Path, body: str) -> None:
-    """Same-directory temp file, fsynced, then renamed: a caller sees the old
-    bytes or the new ones, never a half-written file."""
+    """Atomically replace one file using a same-directory, fsynced temp file."""
     handle = tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent,
                                          prefix=f".{path.name}.", delete=False)
     try:
@@ -393,16 +390,21 @@ def _write(path: Path, body: str) -> None:
         raise
 
 
-_SIZED = {"maxLength": ">", "minLength": "<", "maxItems": ">", "minItems": "<"}
+_SIZED = {
+    "maxLength": ("is too long", ">", "characters"),
+    "minLength": ("is too short", "<", "characters"),
+    "maxItems": ("has too many entries", ">", "entries"),
+    "minItems": ("has too few entries", "<", "entries"),
+}
 
 
 def _describe(error: jsonschema.ValidationError) -> str:
-    """Name the field and the rule:  short_description: '...' is too long (147 > 120)
-
-    The counts are spelled out because "too long" leaves the writer to guess how
-    much to cut, and the record is refused until it fits."""
-    message = error.message
-    if (comparison := _SIZED.get(error.validator)) and hasattr(error.instance, "__len__"):
-        message += f" ({len(error.instance)} {comparison} {error.validator_value})"
+    """Name the field, size rule, actual count, and allowed count."""
     where = ".".join(str(part) for part in error.absolute_path)
+    if sized := _SIZED.get(error.validator):
+        phrase, comparison, unit = sized
+        actual, limit = len(error.instance), error.validator_value
+        message = f"{phrase} ({actual:,} {comparison} {limit:,} {unit})"
+        return f"{where} {message}" if where else message
+    message = error.message
     return f"{where}: {message}" if where else message

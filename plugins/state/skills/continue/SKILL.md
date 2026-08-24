@@ -8,9 +8,6 @@ description: Pick work back up from the memory store. Use when the user says "/c
 Take a description of what is being picked back up, find it, and return the
 context.
 
-There is no session key here, because a session id names a session, not a thread
-of work.
-
 ## Execution
 
 1. **Try the mechanical path first.** An agent knows the directory it is sitting
@@ -37,8 +34,7 @@ of work.
    state_get(task_name="<the task>")
    ```
 
-   This is also what makes a later `/save` possible — the server refuses a write
-   from an agent that has not read.
+   This returns the record and the `write_token` a later `/save` needs.
 
 4. **Brief the user, in this order.** Lead with what changes what they do next:
 
@@ -46,7 +42,7 @@ of work.
    - `blockers` — if any; say so first if there are
    - `next_steps` — what to do now
    - `prior_actions` — especially the dead ends, so they are not walked again
-   - `artifacts` — the paths, so the files can be opened
+   - `artifacts` — the durable references, so they can be followed
    - `description` — only if the task is unfamiliar
 
 5. **If the mechanical search returned no candidates**, say so plainly and

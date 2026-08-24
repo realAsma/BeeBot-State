@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import shutil
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -101,7 +102,7 @@ def test_initialize_refuses_a_task_name_that_is_not_a_filename(store: Store):
 
 
 def test_a_violation_names_the_field_the_rule_and_the_numbers(store: Store):
-    with pytest.raises(Invalid, match=r"short_description.*\(147 > 120\)"):
+    with pytest.raises(Invalid, match=r"short_description.*\(147 > 120 characters\)"):
         store.initialize("t", "x" * 147)
 
 
@@ -144,6 +145,73 @@ def test_update_refuses_a_bad_value_without_coercing_it(store: Store):
         store.update("t", {"completion": "abandoned"})
 
 
+@pytest.mark.parametrize(("field", "limit"), [
+    ("description", 6000),
+    ("current_status", 6000),
+    ("final_learnings", 12000),
+])
+def test_string_limits_report_counts_without_echoing_the_value(
+        store: Store, field: str, limit: int):
+    store.initialize("t", "d")
+    store.update("t", {field: "x" * limit})
+    value = "x" * (limit + 1)
+    with pytest.raises(
+            Invalid,
+            match=rf"{field} is too long \({limit + 1:,} > {limit:,} characters\)",
+    ) as caught:
+        store.update("t", {field: value})
+    assert value not in str(caught.value)
+
+
+@pytest.mark.parametrize(("field", "limit"), [
+    ("prior_actions", 1500),
+    ("next_steps", 1200),
+    ("blockers", 1200),
+])
+def test_list_item_string_limits_report_the_index(store: Store, field: str, limit: int):
+    store.initialize("t", "d")
+    store.update("t", {field: ["x" * limit]})
+    with pytest.raises(
+            Invalid,
+            match=rf"{field}\.0 is too long \({limit + 1:,} > {limit:,} characters\)",
+    ):
+        store.update("t", {field: ["x" * (limit + 1)]})
+
+
+def test_artifact_note_limit_reports_counts(store: Store):
+    store.initialize("t", "d")
+    store.update("t", {"artifacts": [{"item": "commit:abc", "note": "x" * 600}]})
+    with pytest.raises(
+            Invalid,
+            match=r"artifacts\.0\.note is too long \(601 > 600 characters\)",
+    ):
+        store.update("t", {"artifacts": [{"item": "commit:abc", "note": "x" * 601}]})
+
+
+@pytest.mark.parametrize(("field", "limit", "item"), [
+    ("prior_actions", 30, "action"),
+    ("next_steps", 20, "step"),
+    ("blockers", 10, "blocker"),
+    ("artifacts", 50, {"item": "job-1"}),
+])
+def test_collection_limits_report_entry_counts(
+        store: Store, field: str, limit: int, item: object):
+    store.initialize("t", "d")
+    store.update("t", {field: [item] * limit})
+    with pytest.raises(
+            Invalid,
+            match=rf"{field} has too many entries \({limit + 1} > {limit} entries\)",
+    ):
+        store.update("t", {field: [item] * (limit + 1)})
+
+
+def test_artifacts_accept_item_and_reject_path(store: Store):
+    store.initialize("t", "d")
+    store.update("t", {"artifacts": [{"item": "https://example.test/run", "note": "run"}]})
+    with pytest.raises(Invalid, match="Additional properties are not allowed.*path"):
+        store.update("t", {"artifacts": [{"path": "output.txt", "note": "old shape"}]})
+
+
 def test_lists_are_rewritten_whole_not_appended(store: Store):
     store.initialize("t", "d")
     store.update("t", {"prior_actions": ["tried A", "tried B"]})
@@ -160,6 +228,49 @@ def test_a_stale_expected_is_refused_inside_the_lock(states: Path):
     with pytest.raises(StoreError, match="changed since you read it"):
         mine.update("t", {"current_status": "mine"}, expected=held)
     assert mine.get("t")["current_status"] == "theirs"
+
+
+def test_get_waits_for_a_writer_and_returns_a_consistent_snapshot(
+        states: Path, monkeypatch: pytest.MonkeyPatch):
+    writer, reader = Store(states), Store(states)
+    writer.initialize("t", "d")
+    task_written = threading.Event()
+    finish_write = threading.Event()
+    original_write = store_mod._write
+
+    def pause_after_task_file(path: Path, body: str) -> None:
+        original_write(path, body)
+        if path.name == "t.json":
+            task_written.set()
+            assert finish_write.wait(2)
+
+    monkeypatch.setattr(store_mod, "_write", pause_after_task_file)
+    updated: list[str] = []
+    writing = threading.Thread(
+        target=lambda: updated.append(writer.update("t", {"current_status": "new"})))
+    writing.start()
+    assert task_written.wait(2)
+
+    records: list[dict] = []
+    read_started = threading.Event()
+    read_done = threading.Event()
+
+    def read_record() -> None:
+        read_started.set()
+        records.append(reader.get("t"))
+        read_done.set()
+
+    reading = threading.Thread(target=read_record)
+    reading.start()
+    assert read_started.wait(2)
+    assert not read_done.wait(0.1)
+    finish_write.set()
+    writing.join(2)
+    reading.join(2)
+
+    assert not writing.is_alive() and not reading.is_alive()
+    assert records[0]["current_status"] == "new"
+    assert records[0]["updated"] == updated[0]
 
 
 def test_update_of_a_missing_task(store: Store):
@@ -256,5 +367,13 @@ def test_validate_catches_a_hand_edit_that_breaks_the_schema(store: Store, state
 
 def test_a_broken_schema_refuses_everything(states: Path):
     (states / "schema.json").write_text("{ not json")
+    with pytest.raises(StoreError, match="schema unusable"):
+        Store(states)
+
+
+def test_a_schema_missing_a_required_definition_is_unusable(states: Path):
+    schema = json.loads((states / "schema.json").read_text())
+    del schema["$defs"]["index_row"]
+    (states / "schema.json").write_text(json.dumps(schema))
     with pytest.raises(StoreError, match="schema unusable"):
         Store(states)
