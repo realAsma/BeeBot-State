@@ -1,4 +1,4 @@
-# state_store
+# BeeBot State
 
 A global memory layer for Claude Code and Codex. You work on a **task** in a
 **workspace**; this records where you got to, so you or an agent can resume it.
@@ -16,10 +16,10 @@ preceding read, so two callers cannot overwrite each other.
 Requires `python3 -m pip install mcp 'jsonschema>=4'`.
 
 ```sh
-/plugin marketplace add /path/to/state_store   # Claude Code; also owner/repo or Git URL
+/plugin marketplace add /path/to/beebot-state   # Claude Code; also owner/repo or Git URL
 /plugin install beebot-state@beebot
 
-codex plugin marketplace add /path/to/state_store   # Codex
+codex plugin marketplace add /path/to/beebot-state   # Codex
 codex plugin add beebot-state@beebot
 ```
 
@@ -76,19 +76,6 @@ agent ▸  HumanEval recovered to 71.2 from 68.4, still ~3 pts under BF16. Block
          not the fine-tune. Next was re-running MBPP fixed, then the LR sweep.
 ```
 
-## Layout
+## Design
 
-One task is one index row plus one task file, bucketed by workspace:
-
-```text
-~/.beebot_states/
-├── index.jsonl                        one row per task — the search surface
-├── schema.json                        validates every write
-├── home-you-projects-qwen35-recovery/   ← bucket = one workspace
-│   └── qwen35-9b-sft-coding-recovery.json    ← one task file
-└── _nocwd/                              tasks tied to no workspace
-```
-
-Rows hold `task_name`, `cwd`, `updated`, `completion`, `short_description` —
-enough to choose by. Files hold the prose: `current_status`, `prior_actions`,
-`next_steps`, `blockers`, `artifacts`, `final_learnings`.
+See [DESIGN.md](DESIGN.md) for the on-disk layout and record formats.
