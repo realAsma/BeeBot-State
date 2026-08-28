@@ -5,11 +5,13 @@ description: Answer a semantic question from stored task state. Use when the use
 
 # state-ask
 
-Spawn one read-only subagent to answer the state question. If subagent spawning
-is unavailable, report that semantic recall cannot run; do not sweep in the main
-thread.
+Spawn one read-only subagent to answer the state question, so the sweep's opened
+records stay out of the main thread's context. If subagent spawning is
+unavailable, run the same procedure yourself in the main thread and report the
+answer directly.
 
-Give the subagent only these instructions:
+The procedure — the subagent's only instructions, or yours when running it
+directly:
 
 - Use `state_index_search` and `state_get`; never write or spawn another agent.
 - Sweep `7d`, `21d–7d`, `49d–21d`, `105d–49d`, then older, always with `limit=0`.
