@@ -349,8 +349,15 @@ class Store:
 
     @contextmanager
     def _locked(self, shared: bool = False):
-        """Coordinate readers and writers around a consistent store snapshot."""
-        with open(self.dir / ".lock", "w") as handle:
+        """Coordinate readers and writers around a consistent store snapshot.
+
+        "a+", never "w": NFS emulates flock with POSIX record locks, where
+        LOCK_SH needs a descriptor open for READING. On a write-only fd it
+        fails with EBADF while LOCK_EX succeeds, so only readers break and
+        only on a network mount. "a+" also stops truncating a file whose
+        bytes nobody ever reads, once per acquisition.
+        """
+        with open(self.dir / ".lock", "a+") as handle:
             fcntl.flock(handle, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
             try:
                 yield
