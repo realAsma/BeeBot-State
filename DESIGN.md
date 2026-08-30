@@ -1,36 +1,46 @@
 # Design
 
-## One task, two pieces
+## One work item, two pieces
 
-A task is **one row** in the shared `index.jsonl` plus **one task file** of its
-own, bucketed by workspace. The row is what you search; the file is what you
+A work item is **one row** in the shared `index.jsonl` plus **one work file** of
+its own, bucketed by workspace. The row is what you search; the file is what you
 read once you have chosen. Recall is therefore two cheap steps rather than a
 scan: filter the rows, then open one file.
 
 ```text
 ~/.beebot_states/
-├── index.jsonl                        one row per task — the search surface
+├── index.jsonl                        one row per work item — the search surface
 ├── schema.json                        validates every write
-├── home-you-projects-qwen35-recovery/   ← bucket = one workspace
-│   └── qwen35-9b-sft-coding-recovery.json    ← one task file
-└── _nocwd/                              tasks tied to no workspace
+└── home-you-projects-qwen35-recovery-4b1e9c07/   ← bucket = one workspace
+    └── qwen35-9b-sft-coding-recovery.json        ← one work file
 ```
+
+The bucket name is a readable rendering of `cwd` followed by a digest of the
+whole path. The digest is not decoration: a work name is only unique within its
+`cwd`, so two directories sharing a bucket would resolve to one file and one
+record would silently overwrite the other. Truncation and the `/`→`-` flattening
+both make the readable half ambiguous, so the digest is what carries uniqueness.
 
 ## The row
 
 A short pointer, not the content. Rows stay small and uniform so an agent can
-scan every ongoing task — across all workspaces — and still pick one without
+scan every ongoing item — across all workspaces — and still pick one without
 pulling any of that prose into context:
 
 ```json
-{"task_name": "qwen35-9b-sft-coding-recovery", "completion": "open",
+{"work_name": "qwen35-9b-sft-coding-recovery", "completion": "open",
  "cwd": "/home/you/projects/qwen35-recovery", "updated": "2026-03-04T18:20:11Z",
  "short_description": "Recover the coding regression after NVFP4 PTQ",
- "task_state_path": "home-you-projects-qwen35-recovery/qwen35-9b-sft-coding-recovery.json"}
+ "work_state_path": "home-you-projects-qwen35-recovery-4b1e9c07/qwen35-9b-sft-coding-recovery.json"}
 ```
 
+`(cwd, work_name)` is the key. A name only has to be unique in the directory the
+work runs in, which is why `cwd` is required on every read and write and not
+merely a filing convenience: a piece of work is identified by *where* it runs
+and *what* it is.
+
 `cwd` is fixed at initialize, because the bucket is derived from it.
-`task_state_path` is stored rather than recomputed, so changing how buckets are
+`work_state_path` is stored rather than recomputed, so changing how buckets are
 named leaves old rows resolvable.
 
 ## The file

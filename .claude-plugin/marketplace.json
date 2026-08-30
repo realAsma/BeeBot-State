@@ -5,10 +5,10 @@
     {
       "name": "beebot-state",
       "source": "./plugins/state",
-      "description": "Long-term state for long-running tasks: four MCP tools and four skills over a task store.",
-      "version": "2.0.0",
+      "description": "Long-term state for long-running work: four MCP tools and four skills over a work store.",
+      "version": "3.0.0",
       "category": "productivity",
-      "keywords": ["memory", "state", "tasks", "handoff", "beebot"]
+      "keywords": ["memory", "state", "work", "handoff", "beebot"]
     }
   ]
 }

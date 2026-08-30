@@ -1,4 +1,4 @@
-"""The store: filing, time, validation, and the two files a task lives in."""
+"""The store: filing, time, validation, and the two files a work item lives in."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import re
 import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -18,20 +19,21 @@ import jsonschema
 UTC = dt.timezone.utc
 STAMP = "%Y-%m-%dT%H:%M:%SZ"
 
-NOCWD, ROOT_BUCKET = "_nocwd", "_root"
+ROOT_BUCKET = "_root"
 MAX_BUCKET_BYTES = 200  # one path component is capped at 255 everywhere
+DIGEST_BYTES = 8  # of that budget, reserved for the cwd digest
 
 # What state_update may write, and which of the two files it lands in. The
 # agent never writes either directly and does not need to know which is which.
-TASK_FILE_FIELDS = ("description", "current_status", "prior_actions",
+WORK_FILE_FIELDS = ("description", "current_status", "prior_actions",
                     "next_steps", "blockers", "artifacts", "final_learnings")
 INDEX_ROW_FIELDS = ("completion", "short_description")
 # Identity and location are set at initialize; changing them is an admin
-# operation on the index, not something a task does to itself mid-flight.
-IMMUTABLE_FIELDS = ("task_name", "task_state_path", "cwd", "updated")
+# operation on the index, not something a work item does to itself mid-flight.
+IMMUTABLE_FIELDS = ("work_name", "work_state_path", "cwd", "updated")
 
 # Filing, not content, so this never leaves the store.
-INTERNAL = ("task_state_path",)
+INTERNAL = ("work_state_path",)
 
 
 class StoreError(RuntimeError):
@@ -51,49 +53,62 @@ class Invalid(StoreError):
 
 
 class UnsafePath(StoreError):
-    """A task_state_path that would escape states/."""
+    """A work_state_path that would escape states/."""
 
 
 # --------------------------------------------------------------------- filing
 
 
 def slug(cwd: str) -> str:
-    """Strip leading and trailing "/", replace the rest with "-", strip any
-    leading "_" or "-", truncate to 200 bytes, fall back to _root.
+    """A readable rendering of a NORMALIZED cwd, then a digest of the whole of
+    it. Normalize first, always: the digest is over the bytes it is handed, so
+    "/w" and "/w/" would otherwise be two buckets holding the same directory.
 
-        /home/ak/Bots/BeeBotBS  ->  home-ak-Bots-BeeBotBS
+        /home/ak/Bots/BeeBotBS  ->  home-ak-Bots-BeeBotBS-6f3a1c04
 
-    Case, dots and spaces are left alone: this names a directory, not a URL.
-    Deliberately not injective -- task_name is what has to be unique, cwd is
-    what gets queried. The leading strip is what keeps _nocwd and _root
-    unreachable by any real path.
+    INJECTIVE, and that is load-bearing: files live at <slug(cwd)>/<name>.json
+    and a work_name is only unique within its cwd, so two cwds sharing a bucket
+    would let one record silently overwrite another. The readable half cannot
+    carry uniqueness on its own -- it is truncated, "/" flattens to "-", and the
+    leading strip collapses "/", "/_" and "/-" onto the same empty string -- so
+    the digest is unconditional, the _root fallback included. Case, dots and
+    spaces are left alone: this names a directory, not a URL.
+
+    The truncation is for NAME_MAX (one path component caps at 255 bytes, and a
+    cwd may be 4096) and never for uniqueness, which is why the digest is taken
+    over the FULL cwd rather than over what survives truncation -- digesting the
+    truncation would reintroduce exactly the collision the digest buys. Slicing
+    bytes and decoding with "ignore" means a cut through the middle of a UTF-8
+    sequence drops it rather than raising.
     """
-    s = cwd.strip("/").replace("/", "-").lstrip("_-")
-    return s.encode()[:MAX_BUCKET_BYTES].decode("utf-8", "ignore") or ROOT_BUCKET
+    readable = cwd.strip("/").replace("/", "-").lstrip("_-")
+    readable = readable.encode()[:MAX_BUCKET_BYTES - DIGEST_BYTES - 1].decode("utf-8", "ignore")
+    return f"{readable or ROOT_BUCKET}-{sha256(cwd.encode()).hexdigest()[:DIGEST_BYTES]}"
 
 
-def task_state_path(task_name: str, cwd: str | None) -> str:
-    return f"{NOCWD if cwd is None else slug(cwd)}/{task_name}.json"
+def work_state_path(work_name: str, cwd: str) -> str:
+    return f"{slug(cwd)}/{work_name}.json"
 
 
-def normalize_cwd(cwd: str | None) -> str | None:
+def normalize_cwd(cwd: str) -> str:
     """Absolute and unadorned, so two spellings of one directory group together
-    rather than splitting into two cwds."""
+    rather than splitting into two cwds. Required, never optional: cwd is half
+    the key, and a record with no place cannot be identified or found again."""
     if not cwd or not cwd.strip():
-        return None
+        raise StoreError("cwd is required: with work_name it is the key")
     return os.path.normpath(os.path.abspath(os.path.expanduser(cwd.strip()))).rstrip("/") or "/"
 
 
 def resolve_in_store(states_dir: Path, relative: str) -> Path:
     """Structural rather than defensive: the only caller-supplied component is
-    task_name, which the schema constrains to a bare filename. This exists so a
+    work_name, which the schema constrains to a bare filename. This exists so a
     hand-edited index cannot turn a read into an arbitrary-file read."""
     pure = PurePosixPath(relative)
     if not relative or pure.is_absolute() or ".." in pure.parts:
-        raise UnsafePath(f"task_state_path must stay inside states/: {relative!r}")
+        raise UnsafePath(f"work_state_path must stay inside states/: {relative!r}")
     resolved = (states_dir / pure).resolve()
     if states_dir.resolve() not in resolved.parents:
-        raise UnsafePath(f"task_state_path must stay inside states/: {relative!r}")
+        raise UnsafePath(f"work_state_path must stay inside states/: {relative!r}")
     return resolved
 
 
@@ -128,7 +143,7 @@ def resolve_bound(value: str | None) -> str | None:
 
 
 def _next_after(previous: str | None) -> str:
-    """Strictly monotonic per task. `updated` is also the token a stale write is
+    """Strictly monotonic per work item. `updated` is also the token a stale write is
     refused against, so a non-increasing stamp would make a lost update
     undetectable -- and two writes inside one second would produce exactly
     that."""
@@ -163,14 +178,14 @@ class Store:
             self.schema = json.loads((self.dir / "schema.json").read_text("utf-8"))
             jsonschema.Draft202012Validator.check_schema(self.schema)
             definitions = self.schema["$defs"]
-            for name in ("index_row", "task_file"):
+            for name in ("index_row", "work_file"):
                 definitions[name]
         except (OSError, ValueError, KeyError, jsonschema.SchemaError) as exc:
             raise StoreError(f"schema unusable, so every write is refused: {exc}") from exc
         self._checkers = {
             name: jsonschema.Draft202012Validator(
                 {"$ref": f"#/$defs/{name}", "$defs": definitions})
-            for name in ("index_row", "task_file")
+            for name in ("index_row", "work_file")
         }
 
     def check(self, record: str, value: Any) -> None:
@@ -181,8 +196,8 @@ class Store:
     # -------------------------------------------------------------- reading
 
     def read_index(self) -> list[dict[str, Any]]:
-        """Every row, newest first, ties broken by task_name. One read of one
-        file -- this is the recall path and no task file is opened on it."""
+        """Every row, newest first, ties broken by work_name. One read of one
+        file -- this is the recall path and no work file is opened on it."""
         rows = []
         for number, line in enumerate(self.index_path.read_text("utf-8").splitlines(), 1):
             if line.strip():
@@ -190,25 +205,27 @@ class Store:
                     rows.append(json.loads(line))
                 except json.JSONDecodeError as exc:
                     raise StoreError(f"index.jsonl:{number} is not valid JSON: {exc}") from exc
-        rows.sort(key=lambda r: (r.get("updated", ""), r.get("task_name", "")), reverse=True)
+        rows.sort(key=lambda r: (r.get("updated", ""), r.get("work_name", "")), reverse=True)
         return rows
 
-    def row(self, task_name: str) -> dict[str, Any]:
-        return _row_in(self.read_index(), task_name)
+    def row(self, work_name: str, cwd: str) -> dict[str, Any]:
+        return _row_in(self.read_index(), work_name, normalize_cwd(cwd))
 
-    def get(self, task_name: str) -> dict[str, Any]:
-        """The whole record: task file fields plus the index row, merged, so
+    def get(self, work_name: str, cwd: str) -> dict[str, Any]:
+        """The whole record: work file fields plus the index row, merged, so
         callers never see the split. Nothing about ownership comes back --
-        whether an agent SHOULD be working a task is answered elsewhere.
+        whether an agent SHOULD be working an item is answered elsewhere.
 
-        The index row and task file are read under one shared lock, so the
+        The index row and work file are read under one shared lock, so the
         merged record is a consistent snapshot."""
+        cwd = normalize_cwd(cwd)
         with self._locked(shared=True):
-            row = _row_in(self.read_index(), task_name)
-            path = resolve_in_store(self.dir, row["task_state_path"])
+            row = _row_in(self.read_index(), work_name, cwd)
+            path = resolve_in_store(self.dir, row["work_state_path"])
             if not path.exists():
                 raise NotFound(
-                    f"{task_name!r} has an index row but no file; run `serve --validate`")
+                    f"{work_name!r} in {cwd!r} has an index row but no file; "
+                    f"run `serve --validate`")
             return {**json.loads(path.read_text("utf-8")), **_public(row)}
 
     def search(self, filters: Filters) -> list[dict[str, Any]]:
@@ -220,7 +237,8 @@ class Store:
         the one thing a recall path must not do.
         """
         since, until = resolve_bound(filters.since), resolve_bound(filters.until)
-        cwd = normalize_cwd(filters.cwd)
+        # The one place cwd stays optional: here it is a filter, not a key.
+        cwd = normalize_cwd(filters.cwd) if filters.cwd and filters.cwd.strip() else None
         if filters.completion not in (None, "open", "done"):
             raise StoreError(f"completion must be 'open' or 'done', not {filters.completion!r}")
         if filters.limit < 0:
@@ -243,15 +261,15 @@ class Store:
 
     # -------------------------------------------------------------- writing
 
-    def initialize(self, task_name: str, short_description: str,
-                   cwd: str | None = None) -> dict[str, Any]:
-        """STRUCTURE ONLY: bucket, empty task file, index row. It takes exactly
+    def initialize(self, work_name: str, short_description: str,
+                   cwd: str) -> dict[str, Any]:
+        """STRUCTURE ONLY: bucket, empty work file, index row. It takes exactly
         the fields the row cannot be valid without; everything else is content,
         and content has one writer. So no field is ever "create-only", and
-        adding one to the task record changes the schema and nothing else."""
+        adding one to the work record changes the schema and nothing else."""
         cwd = normalize_cwd(cwd)
-        row = {"task_name": task_name,
-               "task_state_path": task_state_path(task_name, cwd),
+        row = {"work_name": work_name,
+               "work_state_path": work_state_path(work_name, cwd),
                "cwd": cwd,
                "short_description": short_description,
                "updated": now(),
@@ -260,20 +278,23 @@ class Store:
 
         with self._locked():
             rows = self.read_index()
-            if any(r.get("task_name") == task_name for r in rows):
-                raise AlreadyExists(f"task_name {task_name!r} is taken; it is globally unique")
-            path = resolve_in_store(self.dir, row["task_state_path"])
+            if any(r.get("work_name") == work_name and r.get("cwd")
+                   and normalize_cwd(r["cwd"]) == cwd for r in rows):
+                raise AlreadyExists(
+                    f"work_name {work_name!r} is already in use in {cwd}; a name has to be "
+                    f"unique within its directory, not across the store")
+            path = resolve_in_store(self.dir, row["work_state_path"])
             path.parent.mkdir(parents=True, exist_ok=True)
             _write(path, "{}\n")
             self._write_index(rows + [row])
         return row
 
-    def update(self, task_name: str, fields: dict[str, Any],
+    def update(self, work_name: str, cwd: str, fields: dict[str, Any],
                expected: str | None = None) -> str:
         """ALL content, ONE call, TWO files. Returns the new `updated` -- the
         caller's next freshness token.
 
-        Write order is task file first, then the index row. A crash between
+        Write order is work file first, then the index row. A crash between
         them leaves content saved with a stale `updated`, which is recoverable;
         the reverse would advertise a version of a file that was never written.
 
@@ -282,28 +303,29 @@ class Store:
         serialize, the second erasing the first. None skips the check.
         """
         if unknown := [k for k in fields
-                       if k not in TASK_FILE_FIELDS and k not in INDEX_ROW_FIELDS]:
+                       if k not in WORK_FILE_FIELDS and k not in INDEX_ROW_FIELDS]:
             if immutable := [k for k in unknown if k in IMMUTABLE_FIELDS]:
                 raise StoreError(f"{', '.join(immutable)}: set at initialize and not writable")
             raise StoreError(f"unknown field(s): {', '.join(sorted(unknown))}")
         if not fields:
             raise StoreError("state_update needs at least one field to write")
+        cwd = normalize_cwd(cwd)
 
         with self._locked():
             rows = self.read_index()
-            current = _row_in(rows, task_name)
+            current = _row_in(rows, work_name, cwd)
             index = rows.index(current)
             row = dict(current)
             if expected is not None and row.get("updated") != expected:
                 raise StoreError(
-                    f"{task_name!r} changed since you read it (you have {expected}, the "
-                    f"store has {row.get('updated')}). Re-read with state_get and retry -- "
+                    f"{work_name!r} in {cwd!r} changed since you read it (you have {expected}, "
+                    f"the store has {row.get('updated')}). Re-read with state_get and retry -- "
                     f"your write would have erased somebody else's.")
-            path = resolve_in_store(self.dir, row["task_state_path"])
+            path = resolve_in_store(self.dir, row["work_state_path"])
 
             content = json.loads(path.read_text("utf-8"))
-            content.update({k: v for k, v in fields.items() if k in TASK_FILE_FIELDS})
-            self.check("task_file", content)
+            content.update({k: v for k, v in fields.items() if k in WORK_FILE_FIELDS})
+            self.check("work_file", content)
 
             row.update({k: v for k, v in fields.items() if k in INDEX_ROW_FIELDS})
             row["updated"] = _next_after(row.get("updated"))
@@ -320,28 +342,35 @@ class Store:
         """Re-check the whole store, catching what the write path cannot: rows
         written before a rule existed, hand-edits, and the cross-record
         invariants schema.json has no way to express."""
-        problems, seen, known = [], set(), set()
+        problems, seen, filed, known = [], set(), set(), set()
         for row in self.read_index():
-            name = row.get("task_name", "<unnamed row>")
+            name = row.get("work_name", "<unnamed row>")
             try:
                 self.check("index_row", row)
             except Invalid as exc:
                 problems.append(f"index row {name}: {exc}")
                 continue
-            # Enforced, never trusted: a flat namespace has nothing structurally
-            # preventing a collision, and a duplicate silently makes one of the
-            # two unreachable.
-            if name in seen:
-                problems.append(f"index row {name}: task_name is not unique")
-            seen.add(name)
+            # Enforced, never trusted: nothing structurally prevents a
+            # collision, and a duplicate silently makes one of the two
+            # unreachable.
+            where = (normalize_cwd(row["cwd"]), name)
+            if where in seen:
+                problems.append(f"index row {name}: (cwd, work_name) is not unique")
+            seen.add(where)
+            # Checked directly rather than inferred from the key: this is the
+            # invariant that actually stops one record overwriting another's
+            # file, and it would also catch a slug that stopped being injective.
+            if row["work_state_path"] in filed:
+                problems.append(f"index row {name}: work_state_path is not unique")
+            filed.add(row["work_state_path"])
             try:
-                path = resolve_in_store(self.dir, row["task_state_path"])
+                path = resolve_in_store(self.dir, row["work_state_path"])
                 known.add(path)
-                self.check("task_file", json.loads(path.read_text("utf-8")))
+                self.check("work_file", json.loads(path.read_text("utf-8")))
             except (StoreError, OSError, ValueError) as exc:
-                problems.append(f"task file {name}: {exc}")
+                problems.append(f"work file {name}: {exc}")
 
-        problems += [f"orphan task file with no index row: {p}"
+        problems += [f"orphan work file with no index row: {p}"
                      for p in sorted(self.dir.glob("*/*.json")) if p.resolve() not in known]
         return problems
 
@@ -374,11 +403,18 @@ def _public(row: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in row.items() if k not in INTERNAL}
 
 
-def _row_in(rows: list[dict[str, Any]], task_name: str) -> dict[str, Any]:
+def _row_in(rows: list[dict[str, Any]], work_name: str, cwd: str) -> dict[str, Any]:
+    """Both halves of the key, and both are named on a miss: a name is only
+    unique within a directory, so a caller that drifted into a subdirectory
+    would otherwise read "no such work" and believe it."""
     for row in rows:
-        if row.get("task_name") == task_name:
+        # A hand-edited row with no cwd matches nothing rather than raising: it
+        # has no place to be found in, and `validate` is where it is reported.
+        if row.get("work_name") != work_name or not row.get("cwd"):
+            continue
+        if normalize_cwd(row["cwd"]) == cwd:
             return row
-    raise NotFound(f"no task named {task_name!r}")
+    raise NotFound(f"no work named {work_name!r} in {cwd!r}")
 
 
 def _write(path: Path, body: str) -> None:

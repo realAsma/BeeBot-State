@@ -1,20 +1,23 @@
-"""State MCP Server — long-term state for long-running tasks.
+"""State MCP Server — long-term state for long-running work.
 
 Tools:
-  state_get             — the whole record for one task
+  state_get             — the whole record for one work item
   state_index_search    — index rows only: time, state, place. One read.
-  state_initialize      — file a new task. Structure only.
+  state_initialize      — file a new work item. Structure only.
   state_update          — all content, in one call. Refused on a stale read.
+
+A record is keyed by (cwd, work_name), so every tool but the search takes both.
 
 None of the tools spawn a model.
 
 Also `--validate`, which re-checks the whole store and exits. Not a tool: it
-adjudicates hand-edits, which is not a thing an agent mid-task should be asked
+adjudicates hand-edits, which is not a thing an agent mid-work should be asked
 to do.
 """
 
 import argparse
 import filecmp
+import json
 import os
 import shutil
 import sys
@@ -52,13 +55,16 @@ CREATE = ToolAnnotations(readOnlyHint=False, destructiveHint=False,
                          idempotentHint=False, openWorldHint=False)
 UPDATE = ToolAnnotations(readOnlyHint=False, destructiveHint=True,
                          idempotentHint=False, openWorldHint=False)
-mcp = FastMCP("state", instructions="""Long-term state for long-running tasks.
+mcp = FastMCP("state", instructions="""Long-term state for long-running work.
 
-A task is one index row (identity, time, place, one-line summary) plus one file
-of prose (status, prior actions, next steps, blockers, artifacts). The row is
-what you search; the file is what you read once you have chosen.
+A work item is one index row (identity, time, place, one-line summary) plus one
+file of prose (status, prior actions, next steps, blockers, artifacts). The row
+is what you search; the file is what you read once you have chosen.
 
-TO FIND YOUR OWN TASK, use the mechanical search first:
+A record is keyed by (cwd, work_name): a name only has to be unique in the
+directory the work runs in, so both are needed to read or write one.
+
+TO FIND YOUR OWN WORK, use the mechanical search first:
     state_index_search(cwd="<the directory you are working in>", completion="open")
 Pick by short_description, then state_get it. Use state-ask only if candidates
 remain ambiguous.
@@ -75,20 +81,22 @@ STORE: Store = None  # type: ignore[assignment]
 
 
 @mcp.tool(annotations=READ)
-def state_get(task_name: str) -> dict:
-    """The whole record for one task: task file fields plus the index row, merged.
+def state_get(work_name: str, cwd: str) -> dict:
+    """The whole record for one work item: work file fields plus the index row.
 
     Reads are unrestricted, and nothing about ownership comes back -- whether
-    you SHOULD be working a task is an execution question answered elsewhere.
+    you SHOULD be working on it is an execution question answered elsewhere.
 
     The returned `write_token` is the `updated` observed under the store's read
     lock. It is neither a read timestamp nor an mtime, and is not separately
     persisted. Pass it to a later state_update.
 
     Args:
-        task_name: The task to read.
+        work_name: The work item to read.
+        cwd: The directory it runs in. Required: it is the other half of the
+            key, so the same name in another directory is a different record.
     """
-    record = STORE.get(task_name)
+    record = STORE.get(work_name, cwd)
     return {**record, "write_token": record["updated"]}
 
 
@@ -100,14 +108,14 @@ def state_index_search(
     cwd: str | None = None,
     limit: Annotated[int, Field(ge=0)] = 20,
 ) -> list[dict]:
-    """Index rows, newest first. Never opens a task file -- one read.
+    """Index rows, newest first. Never opens a work file -- one read.
 
     Filters are mechanical: time, state, place. There is no content filter,
     because content questions belong to the state-ask skill and a substring over
     short_description only fires when you guess a word the writer used. Read
     short_description and pick.
 
-    TO FIND YOUR OWN TASK: state_index_search(cwd=<your directory>,
+    TO FIND YOUR OWN WORK: state_index_search(cwd=<your directory>,
     completion="open"). Deterministic and cheap -- reaching for
     state-ask to answer "which of these three am I on" delegates something a
     filter already answered.
@@ -118,12 +126,13 @@ def state_index_search(
         until: Upper bound on `updated`, exclusive, same forms. A window needs
             two ends: "the 14 days before the last 7" is unsayable with since
             alone.
-        completion: Filter to open or done tasks. This is the one-bit fact, not
+        completion: Filter to open or done work. This is the one-bit fact, not
             `current_status`, which is prose.
-        cwd: The working directory a task runs in. Matched exactly, not by
-            prefix -- a prefix would silently match a nested checkout.
+        cwd: The working directory the work runs in. Optional HERE, and only
+            here, because this is a filter rather than a key. Matched exactly,
+            not by prefix -- a prefix would silently match a nested checkout.
         limit: Caps the ROWS RETURNED; defaults to 20 because a client is
-            picking one task off a list. A SWEEP IS NOT -- pass limit=0. Silent
+            picking one item off a list. A SWEEP IS NOT -- pass limit=0. Silent
             truncation manufactures a false "nothing found".
     """
     return STORE.search(Filters(since=since, until=until, completion=completion,
@@ -131,35 +140,36 @@ def state_index_search(
 
 
 @mcp.tool(annotations=CREATE)
-def state_initialize(task_name: str, short_description: str,
-                     cwd: str | None = None) -> dict:
-    """File a new task and return its first `write_token`: STRUCTURE ONLY.
+def state_initialize(work_name: str, short_description: str, cwd: str) -> dict:
+    """File a new work item and return its first `write_token`: STRUCTURE ONLY.
 
     It takes exactly the fields the index row cannot be valid without;
     everything else is content, and content has one writer -- call state_update
     next to fill it in.
 
-    Fails if task_name is taken. That is the one collision a flat namespace
-    allows, and a duplicate would make one of the two unreachable.
+    Fails if this cwd already has work by that name. The name is free in every
+    other directory, so it can describe the work rather than disambiguate it.
 
     Args:
-        task_name: Globally unique key. Lowercase-hyphenated is the convention.
-            Also the filename stem, so no path separators and no leading '.',
-            '_' or '-'.
+        work_name: Names the work within `cwd`; those two together are the key.
+            Lowercase-hyphenated is the convention. Also the filename stem, so
+            no path separators and no leading '.', '_' or '-'.
         short_description: One line, at most 120 characters. This is what makes
             an index worth having -- the other fields narrow by time and place,
-            but choosing the right task needs content.
-        cwd: The real working directory this task runs in. Optional, but set it
-            here or never: it is not writable afterwards, and it is how the next
-            agent in that directory finds this task at all.
+            but choosing the right work item needs content.
+        cwd: The real working directory this work runs in. Required, and set
+            here or never: it is half the key, it is not writable afterwards,
+            and it is how the next agent in that directory finds this at all.
     """
-    row = STORE.initialize(task_name, short_description, cwd)
-    return {"task_name": row["task_name"], "write_token": row["updated"]}
+    row = STORE.initialize(work_name, short_description, cwd)
+    return {"work_name": row["work_name"], "cwd": row["cwd"],
+            "write_token": row["updated"]}
 
 
 @mcp.tool(annotations=UPDATE)
 def state_update(
-    task_name: str,
+    work_name: str,
+    cwd: str,
     write_token: str,
     description: str | None = None,
     current_status: str | None = None,
@@ -179,13 +189,15 @@ def state_update(
     are rewritten WHOLE, never appended to.
 
     A write is refused for a stale or missing `write_token`, a schema violation,
-    an unknown field, or a task that does not exist. If the token is stale,
+    an unknown field, or a work item that does not exist. If the token is stale,
     re-read, merge, and retry.
 
-    There is no delete. A task becomes completion="done".
+    There is no delete. A work item becomes completion="done".
 
     Args:
-        task_name: The task to write.
+        work_name: The work item to write.
+        cwd: The directory it runs in. Required: it is the other half of the
+            key, so the same name in another directory is a different record.
         write_token: The token returned by state_get or state_initialize.
         description: What this is, and what done looks like. `completion` has to
             be judged against something.
@@ -198,9 +210,9 @@ def state_update(
         artifacts: [{"item": ..., "note": ...}]. Item is any durable reference:
             a path, link, commit, or job ID.
         final_learnings: Usually written once, at the end. A different audience
-            from prior_actions: that serves whoever picks THIS task up, this
-            serves whoever hits the same problem on another task. It is what
-            makes closed tasks worth keeping.
+            from prior_actions: that serves whoever picks THIS work up, this
+            serves whoever hits the same problem on other work. It is what
+            makes closed records worth keeping.
         completion: "open" or "done".
         short_description: Replace the index one-liner. At most 120 characters.
     """
@@ -210,7 +222,7 @@ def state_update(
              "final_learnings": final_learnings, "completion": completion,
              "short_description": short_description}
     fields = {key: value for key, value in given.items() if value is not None}
-    updated = STORE.update(task_name, fields, expected=write_token)
+    updated = STORE.update(work_name, cwd, fields, expected=write_token)
     return {"updated": updated, "write_token": updated}
 
 
@@ -222,15 +234,40 @@ def prepare(states_dir: Path) -> Path:
     the plugin version owns it, not the data directory.
 
     The data directory is one host-independent place, outside any plugin cache,
-    so upgrading the plugin cannot strand or overwrite the tasks -- and so a
-    task saved from one host is visible from the other.
+    so upgrading the plugin cannot strand or overwrite the records -- and so
+    work saved from one host is visible from the other.
     """
     states_dir.mkdir(parents=True, exist_ok=True)
     source, target = ASSETS / "schema.json", states_dir / "schema.json"
     if not target.exists() or not filecmp.cmp(source, target, shallow=False):
         shutil.copyfile(source, target)
-    (states_dir / "index.jsonl").touch()
+    index = states_dir / "index.jsonl"
+    index.touch()
+    _refuse_a_legacy_store(index)
     return states_dir
+
+
+def _refuse_a_legacy_store(index: Path) -> None:
+    """A pre-3.0 store keyed rows on `task_name`. This directory is where such a
+    store already lives, so serving it would append `work_name` rows alongside
+    the old ones and leave a mixed-schema index that every later --validate
+    rejects. The tool names did not change, so nothing else would signal it.
+    Refuse instead: an empty or absent index passes trivially, so a fresh store
+    is unaffected, and this also covers the $BEEBOT_STATE_DIR or --states still
+    pointing at a legacy store somewhere else on disk.
+    """
+    for line in index.read_text("utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # Store() reports a malformed index with the line number.
+        if isinstance(row, dict) and "work_name" not in row:
+            raise StoreError(
+                f"this is a pre-3.0 store, keyed on task_name. Records are keyed on "
+                f"(cwd, work_name) now and there is no converter, so move it aside "
+                f"first: mv {index.parent} {index.parent}.archive")
 
 
 def resolve_states_dir(flag: Path | None) -> tuple[Path, str]:
@@ -293,7 +330,7 @@ def main(argv: list[str] | None = None) -> int:
             print("\n".join(problems), file=sys.stderr)
             print(f"\n{len(problems)} problem(s)", file=sys.stderr)
             return 1
-        print(f"{STORE.dir}: {len(STORE.read_index())} task(s), no problems")
+        print(f"{STORE.dir}: {len(STORE.read_index())} work item(s), no problems")
         return 0
 
     mcp.run()

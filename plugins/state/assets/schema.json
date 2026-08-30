@@ -5,12 +5,12 @@
   "description": "Validates both records in this store and documents them. Per-field hints live on `description`, so the rule and the explanation sit together. Loaded at startup; a broken or missing schema refuses every write.",
 
   "$defs": {
-    "task_name": {
+    "work_name": {
       "type": "string",
       "minLength": 1,
       "maxLength": 120,
       "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
-      "description": "Globally unique key for a task. THE key: one string, no composite. Also the filename stem, so it may not start with '.', '_' or '-' and may not contain a path separator -- that is what keeps task_state_path structurally inside states/."
+      "description": "Names one piece of work within its `cwd`. Half of the key -- (cwd, work_name) -- so a name only has to be unique in the directory it runs in, not across the store. Also the filename stem, so it may not start with '.', '_' or '-' and may not contain a path separator -- that is what keeps work_state_path structurally inside states/."
     },
 
     "timestamp": {
@@ -21,35 +21,35 @@
 
     "index_row": {
       "type": "object",
-      "description": "One row of states/index.jsonl. Written by code, never directly. This is the recall path: every field here narrows a search, and nothing here needs a task file opened to be useful.",
+      "description": "One row of states/index.jsonl. Written by code, never directly. This is the recall path: every field here narrows a search, and nothing here needs a work file opened to be useful.",
       "additionalProperties": false,
-      "required": ["task_name", "task_state_path", "short_description", "updated", "completion"],
+      "required": ["work_name", "work_state_path", "cwd", "short_description", "updated", "completion"],
       "properties": {
-        "task_name": {
-          "$ref": "#/$defs/task_name",
-          "description": "Globally unique. Uniqueness is a cross-record invariant that this schema cannot express; `validate` enforces it."
+        "work_name": {
+          "$ref": "#/$defs/work_name",
+          "description": "Unique together with `cwd`. That pair is a cross-record invariant this schema cannot express; `validate` enforces it."
         },
-        "task_state_path": {
+        "work_state_path": {
           "type": "string",
           "pattern": "^[^/][^\\u0000]*/[^/\\u0000]+\\.json$",
           "maxLength": 400,
-          "description": "'<bucket>/<task_name>.json', relative to states/. Stored rather than derived, even though slug(cwd) would reproduce it: that keeps the slug function swappable, so changing how buckets are named leaves old rows resolvable. Containment is enforced by resolve_in_store, not by this pattern alone."
+          "description": "'<bucket>/<work_name>.json', relative to states/, where the bucket is an injective rendering of `cwd` -- readable prefix plus a digest of the whole path, so two directories can never share one bucket and overwrite each other. Stored rather than derived, even though slug(cwd) would reproduce it: that keeps the slug function swappable, so changing how buckets are named leaves old rows resolvable. Containment is enforced by resolve_in_store, not by this pattern alone."
         },
         "cwd": {
-          "type": ["string", "null"],
+          "type": "string",
           "minLength": 1,
           "maxLength": 4096,
-          "description": "The real working directory this task runs in, outside this store. Optional, and NOT writable after initialize -- the bucket is derived from it, so a mutable cwd would mean moving files. This is the grouping worth querying: 'what else runs in here'."
+          "description": "The real working directory this work runs in, outside this store. Required -- it is half the key, and it is how the next agent in that directory finds this at all. NOT writable after initialize -- the bucket is derived from it, so a mutable cwd would mean moving files."
         },
         "short_description": {
           "type": "string",
           "minLength": 1,
           "maxLength": 120,
-          "description": "One line. This is what makes an index worth having -- the other fields narrow by time and place, but choosing the right task needs content, and without it every search would have to open every task file."
+          "description": "One line. This is what makes an index worth having -- the other fields narrow by time and place, but choosing the right work item needs content, and without it every search would have to open every work file."
         },
         "updated": {
           "$ref": "#/$defs/timestamp",
-          "description": "When anything last happened here. Strictly monotonic per task, so it doubles as the token a stale write is refused against. Always the server's value, never a parameter."
+          "description": "When anything last happened here. Strictly monotonic per work item, so it doubles as the token a stale write is refused against. Always the server's value, never a parameter."
         },
         "completion": {
           "enum": ["open", "done"],
@@ -58,9 +58,9 @@
       }
     },
 
-    "task_file": {
+    "work_file": {
       "type": "object",
-      "description": "One <task_name>.json. Written by AGENTS. Content only -- the index row carries identity, location and time.",
+      "description": "One <work_name>.json. Written by AGENTS. Content only -- the index row carries identity, location and time.",
       "additionalProperties": false,
       "required": [],
       "properties": {
@@ -118,7 +118,7 @@
         "final_learnings": {
           "type": "string",
           "maxLength": 12000,
-          "description": "OPTIONAL, usually written once at the end. Different audience from `prior_actions`: that serves whoever picks THIS task up, this serves whoever hits the same problem on another task, and is what makes closed tasks worth keeping."
+          "description": "OPTIONAL, usually written once at the end. Different audience from `prior_actions`: that serves whoever picks THIS work up, this serves whoever hits the same problem on other work, and is what makes closed records worth keeping."
         }
       }
     }
