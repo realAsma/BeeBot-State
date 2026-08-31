@@ -28,6 +28,14 @@ DIGEST_BYTES = 8  # of that budget, reserved for the cwd digest
 WORK_FILE_FIELDS = ("description", "current_status", "prior_actions",
                     "next_steps", "blockers", "artifacts", "final_learnings")
 INDEX_ROW_FIELDS = ("completion", "short_description")
+# The order a row is WRITTEN in, and the only thing that decides it. Not sorted:
+# index.jsonl is read by eye as well as by code, and this is the order the
+# fields are chosen in -- where the work runs, what it is called, what it is,
+# then when and how far along, with the filing detail last. schema.json lists
+# index_row's properties to match, for a reader, but order is invisible to a
+# validator, so that copy documents this one and cannot enforce it.
+INDEX_ROW_ORDER = ("cwd", "work_name", "short_description", "updated",
+                   "completion", "work_state_path")
 # Identity and location are set at initialize; changing them is an admin
 # operation on the index, not something a work item does to itself mid-flight.
 IMMUTABLE_FIELDS = ("work_name", "work_state_path", "cwd", "updated")
@@ -104,10 +112,12 @@ def resolve_in_store(states_dir: Path, relative: str) -> Path:
     work_name, which the schema constrains to a bare filename. This exists so a
     hand-edited index cannot turn a read into an arbitrary-file read."""
     pure = PurePosixPath(relative)
-    if not relative or pure.is_absolute() or ".." in pure.parts:
-        raise UnsafePath(f"work_state_path must stay inside states/: {relative!r}")
     resolved = (states_dir / pure).resolve()
-    if states_dir.resolve() not in resolved.parents:
+    # Structural (no empty path, no absolute, no "..") and positional (lands
+    # under states/). Both, because the string can be innocent and still resolve
+    # out through a symlinked bucket.
+    if (not relative or pure.is_absolute() or ".." in pure.parts
+            or states_dir.resolve() not in resolved.parents):
         raise UnsafePath(f"work_state_path must stay inside states/: {relative!r}")
     return resolved
 
@@ -205,7 +215,7 @@ class Store:
                     rows.append(json.loads(line))
                 except json.JSONDecodeError as exc:
                     raise StoreError(f"index.jsonl:{number} is not valid JSON: {exc}") from exc
-        rows.sort(key=lambda r: (r.get("updated", ""), r.get("work_name", "")), reverse=True)
+        rows.sort(key=_by_recency, reverse=True)
         return rows
 
     def row(self, work_name: str, cwd: str) -> dict[str, Any]:
@@ -221,7 +231,7 @@ class Store:
         cwd = normalize_cwd(cwd)
         with self._locked(shared=True):
             row = _row_in(self.read_index(), work_name, cwd)
-            path = resolve_in_store(self.dir, row["work_state_path"])
+            path = self._file(row)
             if not path.exists():
                 raise NotFound(
                     f"{work_name!r} in {cwd!r} has an index row but no file; "
@@ -268,22 +278,21 @@ class Store:
         and content has one writer. So no field is ever "create-only", and
         adding one to the work record changes the schema and nothing else."""
         cwd = normalize_cwd(cwd)
-        row = {"work_name": work_name,
-               "work_state_path": work_state_path(work_name, cwd),
-               "cwd": cwd,
+        row = {"cwd": cwd,
+               "work_name": work_name,
                "short_description": short_description,
                "updated": now(),
-               "completion": "open"}
+               "completion": "open",
+               "work_state_path": work_state_path(work_name, cwd)}
         self.check("index_row", row)
 
         with self._locked():
             rows = self.read_index()
-            if any(r.get("work_name") == work_name and r.get("cwd")
-                   and normalize_cwd(r["cwd"]) == cwd for r in rows):
+            if any(_is(r, work_name, cwd) for r in rows):
                 raise AlreadyExists(
                     f"work_name {work_name!r} is already in use in {cwd}; a name has to be "
                     f"unique within its directory, not across the store")
-            path = resolve_in_store(self.dir, row["work_state_path"])
+            path = self._file(row)
             path.parent.mkdir(parents=True, exist_ok=True)
             _write(path, "{}\n")
             self._write_index(rows + [row])
@@ -321,7 +330,7 @@ class Store:
                     f"{work_name!r} in {cwd!r} changed since you read it (you have {expected}, "
                     f"the store has {row.get('updated')}). Re-read with state_get and retry -- "
                     f"your write would have erased somebody else's.")
-            path = resolve_in_store(self.dir, row["work_state_path"])
+            path = self._file(row)
 
             content = json.loads(path.read_text("utf-8"))
             content.update({k: v for k, v in fields.items() if k in WORK_FILE_FIELDS})
@@ -364,7 +373,7 @@ class Store:
                 problems.append(f"index row {name}: work_state_path is not unique")
             filed.add(row["work_state_path"])
             try:
-                path = resolve_in_store(self.dir, row["work_state_path"])
+                path = self._file(row)
                 known.add(path)
                 self.check("work_file", json.loads(path.read_text("utf-8")))
             except (StoreError, OSError, ValueError) as exc:
@@ -375,6 +384,12 @@ class Store:
         return problems
 
     # ---------------------------------------------------------------- private
+
+    def _file(self, row: dict[str, Any]) -> Path:
+        """Where a row's work file is. Always through resolve_in_store, never by
+        joining: the row may have been hand-edited, and this is the only step
+        between what it says and an open()."""
+        return resolve_in_store(self.dir, row["work_state_path"])
 
     @contextmanager
     def _locked(self, shared: bool = False):
@@ -394,13 +409,45 @@ class Store:
                 fcntl.flock(handle, fcntl.LOCK_UN)
 
     def _write_index(self, rows: list[dict[str, Any]]) -> None:
+        """Oldest first on disk, exactly the reverse of the read order: same key,
+        so the file a human opens and the list an agent gets back cannot drift
+        into two different notions of order, and a rewrite that changed nothing
+        produces no diff."""
         _write(self.index_path, "".join(
-            json.dumps(r, sort_keys=True, ensure_ascii=False) + "\n"
-            for r in sorted(rows, key=lambda r: r.get("updated", ""))))
+            json.dumps(_ordered(r), ensure_ascii=False) + "\n"
+            for r in sorted(rows, key=_by_recency)))
+
+
+def _by_recency(row: dict[str, Any]) -> tuple[str, str]:
+    """Total, and total on purpose: `updated` alone leaves same-second rows in
+    whatever order they happened to be read in, which is enough to make two
+    identical stores serialize differently."""
+    return row.get("updated", ""), row.get("work_name", "")
+
+
+def _ordered(row: dict[str, Any]) -> dict[str, Any]:
+    """INDEX_ROW_ORDER first, then anything else in the order it arrived. An
+    unrecognised key is kept rather than dropped: reordering a row must never
+    be able to lose a field the schema has not been taught about yet."""
+    ordered = {key: row[key] for key in INDEX_ROW_ORDER if key in row}
+    return ordered | {k: v for k, v in row.items() if k not in ordered}
 
 
 def _public(row: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in row.items() if k not in INTERNAL}
+
+
+def _is(row: dict[str, Any], work_name: str, cwd: str) -> bool:
+    """THE definition of "this row is that work item", for both the reader that
+    wants the row and the writer that must refuse a second one. Two spellings of
+    the rule would eventually disagree, and the disagreement that matters is a
+    create that sees no clash writing over a record a get can still find.
+
+    `cwd` must already be normalized. A hand-edited row with no cwd matches
+    nothing rather than raising: it has no place to be found in, and `validate`
+    is where it gets reported."""
+    return (row.get("work_name") == work_name and bool(row.get("cwd"))
+            and normalize_cwd(row["cwd"]) == cwd)
 
 
 def _row_in(rows: list[dict[str, Any]], work_name: str, cwd: str) -> dict[str, Any]:
@@ -408,11 +455,7 @@ def _row_in(rows: list[dict[str, Any]], work_name: str, cwd: str) -> dict[str, A
     unique within a directory, so a caller that drifted into a subdirectory
     would otherwise read "no such work" and believe it."""
     for row in rows:
-        # A hand-edited row with no cwd matches nothing rather than raising: it
-        # has no place to be found in, and `validate` is where it is reported.
-        if row.get("work_name") != work_name or not row.get("cwd"):
-            continue
-        if normalize_cwd(row["cwd"]) == cwd:
+        if _is(row, work_name, cwd):
             return row
     raise NotFound(f"no work named {work_name!r} in {cwd!r}")
 

@@ -21,25 +21,19 @@
 
     "index_row": {
       "type": "object",
-      "description": "One row of states/index.jsonl. Written by code, never directly. This is the recall path: every field here narrows a search, and nothing here needs a work file opened to be useful.",
+      "description": "One row of states/index.jsonl. Written by code, never directly. This is the recall path: every field here narrows a search, and nothing here needs a work file opened to be useful. Listed in the order rows are written -- place, name, what it is, when, how far along, filing -- so this and index.jsonl read the same way; store.INDEX_ROW_ORDER is what actually decides, and JSON object order means nothing to a validator.",
       "additionalProperties": false,
-      "required": ["work_name", "work_state_path", "cwd", "short_description", "updated", "completion"],
+      "required": ["cwd", "work_name", "short_description", "updated", "completion", "work_state_path"],
       "properties": {
-        "work_name": {
-          "$ref": "#/$defs/work_name",
-          "description": "Unique together with `cwd`. That pair is a cross-record invariant this schema cannot express; `validate` enforces it."
-        },
-        "work_state_path": {
-          "type": "string",
-          "pattern": "^[^/][^\\u0000]*/[^/\\u0000]+\\.json$",
-          "maxLength": 400,
-          "description": "'<bucket>/<work_name>.json', relative to states/, where the bucket is an injective rendering of `cwd` -- readable prefix plus a digest of the whole path, so two directories can never share one bucket and overwrite each other. Stored rather than derived, even though slug(cwd) would reproduce it: that keeps the slug function swappable, so changing how buckets are named leaves old rows resolvable. Containment is enforced by resolve_in_store, not by this pattern alone."
-        },
         "cwd": {
           "type": "string",
           "minLength": 1,
           "maxLength": 4096,
           "description": "The real working directory this work runs in, outside this store. Required -- it is half the key, and it is how the next agent in that directory finds this at all. NOT writable after initialize -- the bucket is derived from it, so a mutable cwd would mean moving files."
+        },
+        "work_name": {
+          "$ref": "#/$defs/work_name",
+          "description": "Unique together with `cwd`. That pair is a cross-record invariant this schema cannot express; `validate` enforces it."
         },
         "short_description": {
           "type": "string",
@@ -54,6 +48,12 @@
         "completion": {
           "enum": ["open", "done"],
           "description": "The one-bit fact recall filters on. Not `current_status`, which is prose."
+        },
+        "work_state_path": {
+          "type": "string",
+          "pattern": "^[^/][^\\u0000]*/[^/\\u0000]+\\.json$",
+          "maxLength": 400,
+          "description": "'<bucket>/<work_name>.json', relative to states/, where the bucket is an injective rendering of `cwd` -- readable prefix plus a digest of the whole path, so two directories can never share one bucket and overwrite each other. Stored rather than derived, even though slug(cwd) would reproduce it: that keeps the slug function swappable, so changing how buckets are named leaves old rows resolvable. Containment is enforced by resolve_in_store, not by this pattern alone. Last here, and last in a written row: it is filing, and it is the only field never handed back to a caller."
         }
       }
     },
